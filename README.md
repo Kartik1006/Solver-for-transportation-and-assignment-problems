@@ -33,16 +33,14 @@ This tool is designed for students, educators, and professionals who need to sol
 Here are some previews of the application in action.
 
 **Main Application (`app.py`)**
-*(A screenshot of the main window showing the control panel, input grid, and empty solution/plot areas.)*
-![Main Application Window](https_placeholder_for_main_app.png)
+<img width="1037" height="732" alt="image" src="https://github.com/user-attachments/assets/9cfcef6f-4ead-4c6a-96f0-02bc4eb677ba" />
 
 **Interactive Step-by-Step Solver**
-*(A screenshot of the `StepsWindow`, showing the matrix with highlighted cells and the description panel.)*
-![Step-by-Step Visualizer](https_placeholder_for_steps_window.png)
+<img width="1002" height="663" alt="image" src="https://github.com/user-attachments/assets/22a42563-deeb-4d45-8596-9b1b0f8efe16" />
 
 **Final Solution and Visualization**
-*(A screenshot of the main window after solving, showing the solution grid and the final heatmap plot.)*
-![Final Solution Window](https_placeholder_for_results.png)
+<img width="1144" height="806" alt="image" src="https://github.com/user-attachments/assets/1923827b-e2d9-4c8a-beca-7d3951506edf" />
+
 
 ## Installation
 
