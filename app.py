@@ -1,17 +1,7 @@
-# transportation_app.py
-"""
-PySimpleGUI front-end for the enhanced Transportation Problem solver.
+# app.py
 
-Features added:
-- Vogel's Approximation Method (VAM) as an initial method option
-- MODI optimization (automatic iterations until optimality)
-- Interactive allocation grid: after an initial solution is computed, allocations are shown in an editable grid;
-  the user can change allocations (positive numeric) and click "Apply Edits" to re-validate and recompute cost.
-- "Optimize (MODI)" button runs the optimization and shows iteration logs.
-- Input validation, friendly error popups, heatmap visualization (matplotlib), export to CSV/Excel.
-"""
-
-import PySimpleGUI as sg
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
 import pandas as pd
 import numpy as np
 import matplotlib
@@ -19,480 +9,233 @@ matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.pyplot as plt
 import os
-from typing import List
+import solver
+import utils
 
-from solver import (
-    validate_inputs, balance_problem, is_balanced,
-    north_west_corner, least_cost_method, vogels_approximation_method,
-    solution_to_dataframe, cost_of_solution, modi_iteration, optimize_by_modi
-)
+# --- NEW HELPER FUNCTION ---
+def parse_cost_value(value_str):
+    """Converts a string to a float, handling 'inf', 'infinity', 'M'."""
+    val = value_str.strip().lower()
+    if val in ['inf', 'infinity', 'm']:
+        return np.inf
+    try:
+        return float(val)
+    except ValueError:
+        raise ValueError(f"Invalid cost value: '{value_str}'. Please use numbers or 'inf'.")
 
-
-# ---------- Helper to draw matplotlib figure onto PySimpleGUI Canvas ----------
-def draw_figure(canvas, figure):
-    """Draw a matplotlib figure onto a Tk Canvas (used by PySimpleGUI)."""
-    # Clear previous children
-    for child in canvas.winfo_children():
-        child.destroy()
-    figure_canvas_agg = FigureCanvasTkAgg(figure, master=canvas)
+# ... (cost_of_solution, draw_figure are unchanged)
+def cost_of_solution(solution, costs):
+    return np.sum(np.array(solution) * np.array(costs))
+def draw_figure(canvas_frame, figure):
+    for widget in canvas_frame.winfo_children(): widget.destroy()
+    figure_canvas_agg = FigureCanvasTkAgg(figure, master=canvas_frame)
     figure_canvas_agg.draw()
     widget = figure_canvas_agg.get_tk_widget()
     widget.pack(side="top", fill="both", expand=1)
     return figure_canvas_agg
 
-
-# ---------- Grid builder & parser ----------
-def make_input_grid(num_sources, num_destinations, default_cost=0):
-    """Construct cost grid inputs + supply/demand inputs"""
-    heading = [[sg.Text("Costs matrix (rows = sources, columns = destinations)", font=("Segoe UI", 10, "bold"))]]
-    header_row = [sg.Text("Sources \\ Dest", size=(12,1))]
-    for j in range(num_destinations):
-        header_row.append(sg.Text(f"D{j+1}", size=(8,1)))
-    header_row.append(sg.Text("Supply", size=(8,1)))
-    rows = [heading, header_row]
-
-    for i in range(num_sources):
-        row = [sg.Text(f"S{i+1}", size=(12,1))]
-        for j in range(num_destinations):
-            key = f"cost_{i}_{j}"
-            row.append(sg.Input(default_text=str(default_cost), size=(8,1), key=key))
-        row.append(sg.Input(default_text="0", size=(8,1), key=f"supply_{i}"))
-        rows.append(row)
-
-    demand_row = [sg.Text("Demand", size=(12,1))]
-    for j in range(num_destinations):
-        demand_row.append(sg.Input(default_text="0", size=(8,1), key=f"demand_{j}"))
-    demand_row.append(sg.Text("", size=(8,1)))
-    rows.append(demand_row)
-
-    return rows
-
-
-def parse_grid_values(values, num_sources, num_destinations):
-    """Parse the manual grid inputs to structured data"""
-    try:
-        sources = [f"S{i+1}" for i in range(num_sources)]
-        destinations = [f"D{j+1}" for j in range(num_destinations)]
-        costs = []
-        supply = []
-        demand = []
-
-        for i in range(num_sources):
-            row = []
-            for j in range(num_destinations):
-                key = f"cost_{i}_{j}"
-                v = values.get(key)
-                if v is None or v == "":
-                    raise ValueError(f"Cost at row {i+1}, col {j+1} cannot be empty.")
-                row.append(float(v))
-            costs.append(row)
-            sup_val = values.get(f"supply_{i}")
-            if sup_val is None or sup_val == "":
-                raise ValueError(f"Supply for source S{i+1} cannot be empty.")
-            supply.append(float(sup_val))
-
-        for j in range(num_destinations):
-            dem_val = values.get(f"demand_{j}")
-            if dem_val is None or dem_val == "":
-                raise ValueError(f"Demand for destination D{j+1} cannot be empty.")
-            demand.append(float(dem_val))
-
-        return sources, destinations, costs, supply, demand
-    except ValueError as e:
-        raise e
-    except Exception:
-        raise ValueError("Please ensure all inputs are numeric and non-empty.")
-
-
-# ---------- File import (same heuristic as before) ----------
-def read_input_file(path):
-    ext = os.path.splitext(path)[1].lower()
-    try:
-        if ext in [".xls", ".xlsx"]:
-            df = pd.read_excel(path, header=None)
-        elif ext == ".csv":
-            df = pd.read_csv(path, header=None)
-        else:
-            raise ValueError("Unsupported file format. Please upload CSV or Excel (.xls/.xlsx).")
-    except Exception:
-        raise ValueError("Unable to read file. Please check the file and try again.")
-
-    df_trim = df.dropna(how='all', axis=0).dropna(how='all', axis=1)
-    data = df_trim.values
-    rows, cols = data.shape
-    numeric = np.zeros((rows, cols), dtype=bool)
-    for i in range(rows):
-        for j in range(cols):
-            try:
-                float(str(data[i, j]))
-                numeric[i, j] = True
-            except Exception:
-                numeric[i, j] = False
-
-    if numeric.all():
-        raise ValueError("The uploaded file appears to contain only numeric values. Please provide supply/demand or use manual input.")
-
-    try:
-        last_row = df_trim.iloc[-1, :].astype(str).str.lower().str.strip().tolist()
-        demand_idx = None
-        for idx, val in enumerate(last_row):
-            if "demand" in val:
-                demand_idx = idx
-                break
-        if demand_idx is not None or "demand" in "".join(last_row):
-            numeric_block = df_trim.iloc[0:-1, 1:-1]
-            costs = numeric_block.astype(float).values.tolist()
-            supply = df_trim.iloc[0:-1, -1].astype(float).tolist()
-            demand = df_trim.iloc[-1, 1:-1].astype(float).tolist()
-            sources = [str(x) if x is not None else f"S{i+1}" for i, x in enumerate(df_trim.iloc[0:-1, 0].tolist())]
-            destinations = [f"D{j+1}" for j in range(len(costs[0]))]
+class EnhancedSolverApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Enhanced Solver v2.6 (Tkinter)")
+        self.root.geometry("1100x750")
+        self.cost_entries, self.supply_entries, self.demand_entries, self.alloc_entries = [], [], [], []
+        self.current_sources, self.current_destinations, self.current_costs = None, None, None
+        self.current_supply, self.current_demand, self.current_solution, self.current_total_cost = None, None, None, None
+        self.current_initial_solution = None
+        self.create_widgets()
+        self.create_input_grid()
+        self.on_problem_type_change()
+    def create_widgets(self):
+        main_pane = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+        main_pane.pack(fill=tk.BOTH, expand=True)
+        control_frame = ttk.Frame(main_pane, padding=10, width=300); main_pane.add(control_frame, weight=1)
+        right_panel = ttk.Frame(main_pane); main_pane.add(right_panel, weight=4)
+        lf_type = ttk.LabelFrame(control_frame, text="Problem Type", padding=10); lf_type.pack(fill=tk.X, pady=5)
+        self.problem_type_combo = ttk.Combobox(lf_type, values=["Transportation", "Assignment"], state="readonly"); self.problem_type_combo.set("Transportation"); self.problem_type_combo.pack(fill=tk.X)
+        self.problem_type_combo.bind("<<ComboboxSelected>>", self.on_problem_type_change)
+        lf_dims = ttk.LabelFrame(control_frame, text="Problem Dimensions", padding=10); lf_dims.pack(fill=tk.X, pady=5)
+        ttk.Label(lf_dims, text="Sources:").grid(row=0, column=0, sticky='w')
+        self.ns_entry = ttk.Entry(lf_dims, width=5); self.ns_entry.insert(0, "3"); self.ns_entry.grid(row=0, column=1, padx=5)
+        ttk.Label(lf_dims, text="Destinations:").grid(row=0, column=2, sticky='w')
+        self.nd_entry = ttk.Entry(lf_dims, width=5); self.nd_entry.insert(0, "3"); self.nd_entry.grid(row=0, column=3, padx=5)
+        ttk.Button(lf_dims, text="Create Grid", command=self.create_input_grid).grid(row=1, column=0, columnspan=4, pady=5)
+        lf_actions = ttk.LabelFrame(control_frame, text="Actions", padding=10); lf_actions.pack(fill=tk.X, pady=5)
+        ttk.Button(lf_actions, text="Load from File", command=self.load_file).pack(fill=tk.X, pady=2)
+        ttk.Button(lf_actions, text="Export Inputs", command=self.export_inputs).pack(fill=tk.X, pady=2)
+        self.method_label = ttk.Label(lf_actions, text="Initial Method:"); self.method_label.pack(anchor='w', pady=(10, 2))
+        self.method_combo = ttk.Combobox(lf_actions, values=["North-West Corner", "Least Cost", "Vogel (VAM)"], state="readonly"); self.method_combo.set("Vogel (VAM)"); self.method_combo.pack(fill=tk.X, pady=2)
+        self.solve_btn = ttk.Button(lf_actions, text="Solve", command=self.solve); self.solve_btn.pack(fill=tk.X, pady=10)
+        self.modi_btn = ttk.Button(lf_actions, text="Optimize (MODI)", command=self.optimize_modi, state=tk.DISABLED); self.modi_btn.pack(fill=tk.X, pady=2)
+        self.apply_btn = ttk.Button(lf_actions, text="Apply Manual Edits", command=self.apply_edits, state=tk.DISABLED); self.apply_btn.pack(fill=tk.X, pady=2)
+        self.export_btn = ttk.Button(lf_actions, text="Export Result", command=self.export_result, state=tk.DISABLED); self.export_btn.pack(fill=tk.X, pady=2)
+        self.status_var = tk.StringVar(value="Ready."); ttk.Label(control_frame, textvariable=self.status_var, wraplength=280).pack(side=tk.BOTTOM, fill=tk.X, pady=10)
+        self.input_grid_frame = ttk.LabelFrame(right_panel, text="Inputs", padding=10); self.input_grid_frame.pack(fill=tk.X, expand=False, padx=10, pady=5)
+        self.solution_grid_frame = ttk.LabelFrame(right_panel, text="Solution", padding=10); self.solution_grid_frame.pack(fill=tk.X, expand=False, padx=10, pady=5)
+        plot_panel = ttk.Frame(right_panel, padding=10); plot_panel.pack(fill=tk.BOTH, expand=True)
+        self.total_cost_label = ttk.Label(plot_panel, text="", font=("Segoe UI", 12, "bold")); self.total_cost_label.pack()
+        self.canvas_frame = ttk.Frame(plot_panel); self.canvas_frame.pack(fill=tk.BOTH, expand=True)
+    def on_problem_type_change(self, event=None):
+        is_transportation = self.problem_type_combo.get() == "Transportation"
+        state = tk.NORMAL if is_transportation else tk.DISABLED
+        for entry in self.supply_entries + self.demand_entries: entry.config(state=state)
+        self.method_combo.config(state=state); self.method_label.config(state=state); self.modi_btn.config(state=state)
+        if not is_transportation:
+            self.ns_entry.config(state=tk.NORMAL); self.nd_entry.delete(0, tk.END); self.nd_entry.insert(0, self.ns_entry.get()); self.nd_entry.config(state=tk.DISABLED)
+        else: self.nd_entry.config(state=tk.NORMAL)
+        self.create_input_grid()
+    def _clear_frame(self, frame):
+        for widget in frame.winfo_children(): widget.destroy()
+    def create_input_grid(self, costs=None, supply=None, demand=None):
+        self._clear_frame(self.input_grid_frame); self.apply_btn.config(state=tk.DISABLED)
+        try:
+            num_s = int(self.ns_entry.get())
+            if self.problem_type_combo.get() == "Assignment":
+                self.nd_entry.config(state=tk.NORMAL); self.nd_entry.delete(0, tk.END); self.nd_entry.insert(0, str(num_s)); self.nd_entry.config(state=tk.DISABLED)
+            num_d = int(self.nd_entry.get())
+        except ValueError: messagebox.showerror("Error", "Sources/Destinations must be integers."); return
+        is_transportation = self.problem_type_combo.get() == "Transportation"
+        for j in range(num_d): ttk.Label(self.input_grid_frame, text=f"D{j+1}", font="TkDefaultFont 9 bold").grid(row=0, column=j+1)
+        if is_transportation: ttk.Label(self.input_grid_frame, text="Supply", font="TkDefaultFont 9 bold").grid(row=0, column=num_d+1)
+        self.cost_entries, self.supply_entries = [], []
+        for i in range(num_s):
+            ttk.Label(self.input_grid_frame, text=f"S{i+1}", font="TkDefaultFont 9 bold").grid(row=i+1, column=0, padx=5)
+            row_entries = []
+            for j in range(num_d):
+                cost_val = costs[i][j] if costs else 0
+                display_val = 'inf' if cost_val == np.inf else str(cost_val)
+                e = ttk.Entry(self.input_grid_frame, width=8); e.insert(0, display_val); e.grid(row=i+1, column=j+1, padx=2, pady=2); row_entries.append(e)
+            self.cost_entries.append(row_entries)
+            if is_transportation:
+                se = ttk.Entry(self.input_grid_frame, width=8); se.insert(0, str(supply[i] if supply else 0)); se.grid(row=i+1, column=num_d+1, padx=5); self.supply_entries.append(se)
+        self.demand_entries = []
+        if is_transportation:
+            ttk.Label(self.input_grid_frame, text="Demand", font="TkDefaultFont 9 bold").grid(row=num_s+1, column=0)
+            for j in range(num_d):
+                de = ttk.Entry(self.input_grid_frame, width=8); de.insert(0, str(demand[j] if demand else 0)); de.grid(row=num_s+1, column=j+1); self.demand_entries.append(de)
+        self.status_var.set(f"Created {num_s}x{num_d} grid. Enter values.")
+    
+    def parse_grid_values(self):
+        try:
+            costs = [[parse_cost_value(e.get()) for e in row] for row in self.cost_entries]
+            supply = [float(e.get()) for e in self.supply_entries] if self.supply_entries else None
+            demand = [float(e.get()) for e in self.demand_entries] if self.demand_entries else None
+            sources = [f"S{i+1}" for i in range(len(costs))]; destinations = [f"D{j+1}" for j in range(len(costs[0]))]
             return sources, destinations, costs, supply, demand
-    except Exception:
-        pass
+        except ValueError as e: raise ValueError(f"Input Error: {e}")
+        
+    def solve(self):
+        self._clear_frame(self.solution_grid_frame)
+        try:
+            s, d, c, sup, dem = self.parse_grid_values()
+            problem_type = self.problem_type_combo.get()
 
-    raise ValueError("Could not parse the uploaded file. Use the manual grid or upload a file with supply as last column and demand as last row.")
+            if problem_type == "Transportation":
+                if sum(sup) != sum(dem): messagebox.showwarning("Unbalanced", "Total Supply != Total Demand.")
+                if self.method_combo.get() == "North-West Corner" and np.isinf(np.array(c)).any():
+                    messagebox.showwarning("North-West Corner Warning", "This method ignores costs and may allocate to a forbidden (infinite cost) cell.")
+                method = self.method_combo.get()
+                if method == "North-West Corner": solution, steps = solver.north_west_corner(sup, dem)
+                elif method == "Least Cost": solution, steps = solver.least_cost(c, sup, dem)
+                else: solution, steps = solver.vogel_approximation(c, sup, dem)
+                self.current_initial_solution = solution.copy()
+                total_cost = cost_of_solution(solution, c)
+                utils.StepsWindow(self.root, f"{method} Steps", steps, s, d)
+            else:
+                assignments, total_cost, solution, steps = solver.solve_assignment_problem(c)
+                utils.StepsWindow(self.root, "Assignment Solver Steps", steps, s, d)
+            
+            if np.isinf(total_cost):
+                messagebox.showerror("Infeasible Solution", "The solution requires using a forbidden (infinite cost) route. This means no feasible solution exists for the given constraints.")
+                return
 
+            self.current_sources, self.current_destinations, self.current_costs = s, d, c
+            self.current_supply, self.current_demand = sup, dem
+            self.current_solution, self.current_total_cost = solution, total_cost
+            self.status_var.set(f"Solved. Cost: {total_cost:.2f}.")
+            self.create_allocation_grid(); self.update_plot()
+            self.apply_btn.config(state=tk.NORMAL); self.export_btn.config(state=tk.NORMAL)
+            if problem_type == "Transportation": self.modi_btn.config(state=tk.NORMAL)
+        except Exception as e: messagebox.showerror("Error", str(e))
 
-# ---------- GUI main ----------
-def main():
-    sg.theme("SystemDefault")
-
-    # Top controls
-    control_col = [
-        [sg.Text("Transportation Solver — Enhanced", font=("Segoe UI", 14, "bold"))],
-        [sg.Text("Sources:"), sg.Input("3", size=(5,1), key="-NS-"),
-         sg.Text("Destinations:"), sg.Input("3", size=(5,1), key="-ND-"),
-         sg.Button("Create Grid", key="-CREATE-")],
-        [sg.Button("Load CSV/Excel", key="-LOAD-"), sg.Input(key="-FILEPATH-", visible=False)],
-        [sg.Text("Initial Method:"), sg.Combo(["North-West Corner", "Least Cost", "Vogel (VAM)"], default_value="Vogel (VAM)", key="-METHOD-")],
-        [sg.Button("Solve", key="-SOLVE-"), sg.Button("Optimize (MODI)", key="-MODI-", disabled=True)],
-        [sg.Button("Apply Manual Edits", key="-APPLY-", disabled=True), sg.Button("Export Result", key="-EXPORT-", disabled=True)],
-        [sg.HorizontalSeparator()],
-        [sg.Text("", key="-STATUS-", size=(80,1))]
-    ]
-
-    grid_col = sg.Column([[]], key="-GRIDCOL-", scrollable=True, vertical_scroll_only=True, size=(700, 320))
-    plot_col = sg.Column([[]], key="-PLOTCOL-")
-
-    layout = [
-        [sg.Column(control_col), sg.VerticalSeparator(), sg.Column([[grid_col], [plot_col]])],
-    ]
-
-    window = sg.Window("Transportation Solver — Enhanced", layout, finalize=True, resizable=True)
-
-    current_num_sources = 3
-    current_num_destinations = 3
-    window["-GRIDCOL-"].update(make_input_grid(current_num_sources, current_num_destinations))
-
-    # State holders
-    current_sources = None
-    current_destinations = None
-    current_costs = None
-    current_supply = None
-    current_demand = None
-    current_solution = None
-    current_total_cost = None
-
-    fig_agg = None
-
-    while True:
-        event, values = window.read(timeout=100)
-        if event == sg.WIN_CLOSED:
-            break
-
-        if event == "-CREATE-":
-            try:
-                ns = int(values["-NS-"])
-                nd = int(values["-ND-"])
-                if ns <= 0 or nd <= 0:
-                    sg.popup_error("Number of sources and destinations must be positive.")
-                    continue
-                current_num_sources = ns
-                current_num_destinations = nd
-                window["-GRIDCOL-"].update(make_input_grid(ns, nd, default_cost=0))
-                window["-STATUS-"].update(f"Created grid: {ns} x {nd}. Enter values.")
-            except Exception:
-                sg.popup_error("Invalid numbers. Please enter integers for sources/destinations.")
-
-        if event == "-LOAD-":
-            path = sg.popup_get_file("Select CSV or Excel file", file_types=(("CSV Files", "*.csv"), ("Excel Files", "*.xls;*.xlsx"), ("All Files", "*.*")))
-            if path:
-                try:
-                    srcs, dests, costs, supply, demand = read_input_file(path)
-                    ns = len(srcs)
-                    nd = len(dests)
-                    current_num_sources = ns
-                    current_num_destinations = nd
-                    window["-GRIDCOL-"].update(make_input_grid(ns, nd, default_cost=0))
-                    for i in range(ns):
-                        for j in range(nd):
-                            window[f"cost_{i}_{j}"].update(str(costs[i][j]))
-                        window[f"supply_{i}"].update(str(supply[i]))
-                    for j in range(nd):
-                        window[f"demand_{j}"].update(str(demand[j]))
-                    window["-STATUS-"].update(f"Loaded: {os.path.basename(path)}")
-                except Exception as e:
-                    sg.popup_error("File load error", str(e))
-
-        if event == "-SOLVE-":
-            try:
-                sources, destinations, costs, supply, demand = parse_grid_values(values, current_num_sources, current_num_destinations)
-            except Exception as e:
-                sg.popup_error("Input error", str(e))
-                continue
-
-            valid, msg = validate_inputs(sources, destinations, costs, supply, demand)
-            if not valid:
-                sg.popup_error("Validation error", msg)
-                continue
-
-            if not is_balanced(supply, demand):
-                ans = sg.popup_yes_no("Problem unbalanced (total supply != total demand). Auto-balance with dummy row/col?")
-                if ans != "Yes":
-                    continue
-
-            try:
-                s2, d2, c2, sup2, dem2, was_balanced = balance_problem(sources, destinations, costs, supply, demand)
-            except Exception as e:
-                sg.popup_error("Balancing error", str(e))
-                continue
-
-            method = values["-METHOD-"]
-            try:
-                if method == "North-West Corner":
-                    sol, total, logs = north_west_corner(s2, d2, c2, sup2, dem2)
-                elif method == "Least Cost":
-                    sol, total, logs = least_cost_method(s2, d2, c2, sup2, dem2)
-                else:
-                    sol, total, logs = vogels_approximation_method(s2, d2, c2, sup2, dem2)
-            except Exception:
-                sg.popup_error("Solver error", "Unexpected error while solving. Check inputs.")
-                continue
-
-            # Save state
-            current_sources = s2
-            current_destinations = d2
-            current_costs = c2
-            current_supply = sup2
-            current_demand = dem2
-            current_solution = sol
-            current_total_cost = total
-
-            # Show a popup summary (allocations + total)
-            summary_lines = [f"Method: {method}", f"Total Cost: {total:.4f}", "Allocations:"]
-            # produce allocation logs from solution:
-            for i in range(len(s2)):
-                for j in range(len(d2)):
-                    if current_solution[i][j] != 0:
-                        summary_lines.append(f"{s2[i]} -> {d2[j]} : {current_solution[i][j]} (c={c2[i][j]})")
-            sg.popup_scrolled("\n".join(summary_lines), title="Initial Solution", size=(70,20))
-
-            # Show interactive allocation grid (inputs editable)
-            alloc_grid = [[sg.Text("Allocations (editable)", font=("Segoe UI", 10, "bold"))]]
-            head = [sg.Text("Sources \\ Dest", size=(12,1))]
-            for j in range(len(d2)):
-                head.append(sg.Text(d2[j], size=(8,1)))
-            head.append(sg.Text("Remaining Supply", size=(12,1)))
-            alloc_grid.append(head)
-            # compute remaining supply for display
-            for i in range(len(s2)):
-                row = [sg.Text(s2[i], size=(12,1))]
-                for j in range(len(d2)):
-                    val = current_solution[i][j]
-                    row.append(sg.Input(default_text=str(val), size=(8,1), key=f"alloc_{i}_{j}"))
-                # remaining supply
-                remaining = current_supply[i] - sum(current_solution[i])
-                row.append(sg.Text(f"{remaining:.2f}", size=(12,1), key=f"rem_sup_{i}"))
-                alloc_grid.append(row)
-            # demand row
-            dem_row = [sg.Text("Demand Remain", size=(12,1))]
-            for j in range(len(d2)):
-                col_sum = sum(current_solution[i][j] for i in range(len(s2)))
-                remd = current_demand[j] - col_sum
-                dem_row.append(sg.Text(f"{remd:.2f}", size=(8,1), key=f"rem_dem_{j}"))
-            dem_row.append(sg.Text("", size=(12,1)))
-            alloc_grid.append(dem_row)
-
-            # Update grid and enable buttons
-            window["-GRIDCOL-"].update(alloc_grid)
-            window["-MODI-"].update(disabled=False)
-            window["-APPLY-"].update(disabled=False)
-            window["-EXPORT-"].update(disabled=False)
-            window["-STATUS-"].update(f"Solved ({method}). Total cost: {total:.2f}. You may edit allocations then 'Apply Edits' or click 'Optimize (MODI)'.")
-            # Render allocation heatmap
-            try:
-                fig, ax = plt.subplots(figsize=(5,4))
-                arr = np.array(current_solution, dtype=float)
-                im = ax.imshow(arr, aspect="auto")
-                ax.set_xticks(np.arange(len(d2)))
-                ax.set_yticks(np.arange(len(s2)))
-                ax.set_xticklabels(d2, rotation=45)
-                ax.set_yticklabels(s2)
-                for i in range(arr.shape[0]):
-                    for j in range(arr.shape[1]):
-                        if arr[i,j] != 0:
-                            ax.text(j, i, f"{arr[i,j]:.0f}", ha="center", va="center", color="white")
-                ax.set_title("Allocations heatmap")
-                fig.colorbar(im, ax=ax)
-                # place canvas in plot column
-                window["-PLOTCOL-"].update([[sg.Canvas(key="-CANVAS-")], [sg.Text(f"Total Cost: {total:.2f}", key="-TOTCOST-")]])
-                window.refresh()
-                canvas = window["-CANVAS-"].TKCanvas
-                fig_agg = draw_figure(canvas, fig)
-            except Exception:
-                pass  # harmless if plotting fails
-
-        if event == "-APPLY-":
-            # Read user-edited allocations, validate (non-negative, meet supply/demand), then update solution and cost
-            if current_solution is None:
-                sg.popup_error("No current solution to edit. Solve a problem first.")
-                continue
-            m = len(current_sources)
-            n = len(current_destinations)
-            try:
-                new_sol = [[0.0]*n for _ in range(m)]
-                for i in range(m):
-                    for j in range(n):
-                        key = f"alloc_{i}_{j}"
-                        v = values.get(key)
-                        if v is None or v == "":
-                            raise ValueError("All allocation cells must be filled (enter 0 if none).")
-                        val = float(v)
-                        if val < 0:
-                            raise ValueError("Allocations must be non-negative.")
-                        new_sol[i][j] = val
-                # Validate row sums <= supply and col sums <= demand and totals equal
-                row_sums = [sum(new_sol[i]) for i in range(m)]
-                col_sums = [sum(new_sol[i][j] for i in range(m)) for j in range(n)]
-                for i in range(m):
-                    if row_sums[i] - current_supply[i] > 1e-6:
-                        raise ValueError(f"Row {current_sources[i]} allocations exceed its supply ({row_sums[i]} > {current_supply[i]}).")
-                for j in range(n):
-                    if col_sums[j] - current_demand[j] > 1e-6:
-                        raise ValueError(f"Column {current_destinations[j]} allocations exceed its demand ({col_sums[j]} > {current_demand[j]}).")
-                # If totals don't match, warn and ask user to confirm (we allow partial allocations)
-                total_alloc = sum(row_sums)
-                if abs(total_alloc - sum(current_supply)) > 1e-6 and abs(total_alloc - sum(current_demand)) > 1e-6:
-                    ans = sg.popup_yes_no("Total allocations do not match total supply/demand. Proceed anyway?")
-                    if ans != "Yes":
-                        continue
-                # accept new allocations
-                current_solution = new_sol
-                current_total_cost = cost_of_solution(current_solution, current_costs)
-                sg.popup("Allocations applied", f"New total cost: {current_total_cost:.4f}")
-                window["-STATUS-"].update(f"Manual allocations applied. Total cost: {current_total_cost:.2f}")
-                window["-TOTCOST-"].update(f"Total Cost: {current_total_cost:.2f}")
-                # update remaining labels
-                for i in range(m):
-                    rem = current_supply[i] - sum(current_solution[i])
-                    try:
-                        window[f"rem_sup_{i}"].update(f"{rem:.2f}")
-                    except Exception:
-                        pass
-                for j in range(n):
-                    remd = current_demand[j] - sum(current_solution[i][j] for i in range(m))
-                    try:
-                        window[f"rem_dem_{j}"].update(f"{remd:.2f}")
-                    except Exception:
-                        pass
-                # re-plot updated allocations
-                try:
-                    fig, ax = plt.subplots(figsize=(5,4))
-                    arr = np.array(current_solution, dtype=float)
-                    im = ax.imshow(arr, aspect="auto")
-                    ax.set_xticks(np.arange(n))
-                    ax.set_yticks(np.arange(m))
-                    ax.set_xticklabels(current_destinations, rotation=45)
-                    ax.set_yticklabels(current_sources)
-                    for i in range(arr.shape[0]):
-                        for j in range(arr.shape[1]):
-                            if arr[i,j] != 0:
-                                ax.text(j, i, f"{arr[i,j]:.0f}", ha="center", va="center", color="white")
-                    ax.set_title("Allocations heatmap (edited)")
-                    fig.colorbar(im, ax=ax)
-                    canvas = window["-CANVAS-"].TKCanvas
-                    fig_agg = draw_figure(canvas, fig)
-                except Exception:
-                    pass
-            except Exception as e:
-                sg.popup_error("Invalid allocations", str(e))
-
-        if event == "-MODI-":
-            if current_solution is None:
-                sg.popup_error("No solution available. Solve first.")
-                continue
-            # Run MODI optimization with safety iterations
-            try:
-                opt_sol, opt_cost, iter_logs = optimize_by_modi(current_solution, current_costs, current_sources, current_destinations, max_iterations=50)
-                # Present iteration logs
-                lines = []
-                for entry in iter_logs:
-                    it = entry["iteration"]
-                    info = entry["info"]
-                    c = entry["cost"]
-                    lines.append(f"Iteration {it}: cost {c:.4f}")
-                    for ln in info.get("logs", []):
-                        lines.append("  - " + ln)
-                    entering = info.get("entering")
-                    if entering:
-                        lines.append(f"    entering cell {entering[0], entering[1]} delta={entering[2]:.4f}")
-                    if info.get("optimal"):
-                        lines.append("    Reached optimality (no negative reduced costs).")
-                sg.popup_scrolled("\n".join(lines), title="MODI Iterations", size=(80, 30))
-                # Update state
-                current_solution = opt_sol
-                current_total_cost = opt_cost
-                # Update allocation inputs on grid
-                m = len(current_sources)
-                n = len(current_destinations)
-                for i in range(m):
-                    for j in range(n):
-                        try:
-                            window[f"alloc_{i}_{j}"].update(str(current_solution[i][j]))
-                        except Exception:
-                            pass
-                window["-STATUS-"].update(f"Optimization finished. Cost: {current_total_cost:.2f}")
-                window["-TOTCOST-"].update(f"Total Cost: {current_total_cost:.2f}")
-                # re-plot
-                try:
-                    fig, ax = plt.subplots(figsize=(5,4))
-                    arr = np.array(current_solution, dtype=float)
-                    im = ax.imshow(arr, aspect="auto")
-                    ax.set_xticks(np.arange(n))
-                    ax.set_yticks(np.arange(m))
-                    ax.set_xticklabels(current_destinations, rotation=45)
-                    ax.set_yticklabels(current_sources)
-                    for i in range(arr.shape[0]):
-                        for j in range(arr.shape[1]):
-                            if arr[i,j] != 0:
-                                ax.text(j, i, f"{arr[i,j]:.0f}", ha="center", va="center", color="white")
-                    ax.set_title("Allocations heatmap (optimized)")
-                    fig.colorbar(im, ax=ax)
-                    canvas = window["-CANVAS-"].TKCanvas
-                    fig_agg = draw_figure(canvas, fig)
-                except Exception:
-                    pass
-            except Exception as e:
-                sg.popup_error("MODI error", str(e))
-
-        if event == "-EXPORT-":
-            if current_solution is None:
-                sg.popup_error("No result to export. Solve first.")
-                continue
-            df = solution_to_dataframe(current_sources, current_destinations, current_solution)
-            path = sg.popup_get_file("Save result", save_as=True, file_types=(("Excel Files","*.xlsx"), ("CSV Files","*.csv")), default_extension=".xlsx")
-            if path:
-                try:
-                    if path.lower().endswith(".csv"):
-                        df.to_csv(path)
-                    else:
-                        df.to_excel(path, sheet_name="Allocation")
-                    sg.popup("Exported", f"Saved to {path}")
-                except Exception as e:
-                    sg.popup_error("Export failed", str(e))
-
-    window.close()
-
+    def optimize_modi(self):
+        if self.current_initial_solution is None: messagebox.showerror("Error", "Find an initial solution first via 'Solve'."); return
+        try:
+            optimal_solution, modi_steps = solver.modi_method(self.current_costs, self.current_initial_solution)
+            self.current_solution = optimal_solution
+            self.current_total_cost = cost_of_solution(self.current_solution, self.current_costs)
+            if np.isinf(self.current_total_cost):
+                messagebox.showerror("Infeasible Solution", "MODI resulted in an infinite cost solution. This can happen if the initial solution was invalid (e.g., from NWC on a forbidden route).")
+                return
+            utils.StepsWindow(self.root, "MODI Optimization Steps", modi_steps, self.current_sources, self.current_destinations)
+            self.create_allocation_grid(); self.update_plot()
+            self.status_var.set(f"MODI optimization complete. Final Cost: {self.current_total_cost:.2f}")
+            messagebox.showinfo("MODI", "Optimization complete! Check the steps window.")
+        except Exception as e: messagebox.showerror("MODI Error", f"Could not optimize: {e}")
+    
+    # ... (rest of the class methods are unchanged)
+    def create_allocation_grid(self):
+        self._clear_frame(self.solution_grid_frame)
+        for j, dest in enumerate(self.current_destinations): ttk.Label(self.solution_grid_frame, text=dest, font="TkDefaultFont 9 bold").grid(row=0, column=j+1)
+        self.alloc_entries = []
+        for i, src in enumerate(self.current_sources):
+            ttk.Label(self.solution_grid_frame, text=src, font="TkDefaultFont 9 bold").grid(row=i+1, column=0, padx=5)
+            row_entries = []
+            for j in range(len(self.current_destinations)):
+                e = ttk.Entry(self.solution_grid_frame, width=8); e.insert(0, f"{self.current_solution[i][j]:.2f}"); e.grid(row=i+1, column=j+1, padx=2, pady=2); row_entries.append(e)
+            self.alloc_entries.append(row_entries)
+    def update_plot(self):
+        self._clear_frame(self.canvas_frame); self.total_cost_label.config(text=f"Total Cost: {self.current_total_cost:.2f}")
+        fig, ax = plt.subplots(figsize=(5, 4))
+        arr = np.array(self.current_solution, dtype=float)
+        vmax = None if self.problem_type_combo.get() == "Transportation" else 1 
+        im = ax.imshow(arr, aspect="auto", cmap="Greens", vmax=vmax)
+        ax.set_xticks(np.arange(len(self.current_destinations))); ax.set_yticks(np.arange(len(self.current_sources)))
+        ax.set_xticklabels(self.current_destinations, rotation=45, ha="right"); ax.set_yticklabels(self.current_sources)
+        for i in range(arr.shape[0]):
+            for j in range(arr.shape[1]):
+                if arr[i, j] > 1e-6: ax.text(j, i, f"{arr[i, j]:.0f}", ha="center", va="center", color="white")
+        ax.set_title("Allocations / Assignments"); fig.tight_layout()
+        draw_figure(self.canvas_frame, fig)
+    def apply_edits(self):
+        try:
+            new_sol = [[float(e.get()) for e in row] for row in self.alloc_entries]
+            self.current_solution = np.array(new_sol)
+            self.current_total_cost = cost_of_solution(self.current_solution, self.current_costs)
+            self.status_var.set(f"Manual edits applied. New cost: {self.current_total_cost:.2f}")
+            self.update_plot()
+        except Exception as e: messagebox.showerror("Error", f"Invalid allocation values: {e}")
+    def export_inputs(self):
+        path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV Files", "*.csv")])
+        if not path: return
+        try:
+            s, d, c, sup, dem = self.parse_grid_values()
+            df = pd.DataFrame(c, index=s, columns=d)
+            if self.problem_type_combo.get() == "Transportation" and sup and dem:
+                df['Supply'] = sup; dem_row = pd.Series(dem, index=d, name='Demand').to_frame().T
+                df = pd.concat([df, dem_row])
+            df.to_csv(path); messagebox.showinfo("Success", "Input data exported.")
+        except Exception as e: messagebox.showerror("Export Error", str(e))
+    def load_file(self):
+        path = filedialog.askopenfilename(filetypes=[("CSV/Excel", "*.csv;*.xls;*.xlsx")])
+        if not path: return
+        try:
+            s, d, c, sup, dem = utils.import_data(path)
+            self.ns_entry.delete(0, tk.END); self.ns_entry.insert(0, str(len(sup)))
+            self.nd_entry.delete(0, tk.END); self.nd_entry.insert(0, str(len(dem)))
+            self.problem_type_combo.set("Transportation"); self.on_problem_type_change()
+            self.create_input_grid(c, sup, dem)
+            self.status_var.set(f"Loaded from {os.path.basename(path)}")
+        except Exception as e: messagebox.showerror("File Load Error", str(e))
+    def export_result(self):
+        path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV Files", "*.csv")])
+        if not path: return
+        try:
+            df = pd.DataFrame(self.current_solution, index=self.current_sources, columns=self.current_destinations)
+            df.to_csv(path); messagebox.showinfo("Success", f"Result saved to {path}")
+        except Exception as e: messagebox.showerror("Export Error", str(e))
 
 if __name__ == "__main__":
-    main()
+    root = tk.Tk()
+    app = EnhancedSolverApp(root)
+    root.mainloop()
