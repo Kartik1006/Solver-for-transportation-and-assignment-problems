@@ -51,7 +51,7 @@ To run this application on your local machine, follow these steps.
 
 **2. Clone the Repository**
 ```bash
-git clone [https://github.com/your-username/your-repository-name.git](https://github.com/Kartik1006/Solver-for-transportation-and-assignment-problems.git)
+git clone https://github.com/Kartik1006/Solver-for-transportation-and-assignment-problems.git
 cd Solver-for-transportation-and-assignment-problems
 ```
 
