@@ -1,5 +1,4 @@
 # app.py
-
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import pandas as pd
@@ -239,3 +238,4 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = EnhancedSolverApp(root)
     root.mainloop()
+
